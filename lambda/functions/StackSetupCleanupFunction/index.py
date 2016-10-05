@@ -19,7 +19,7 @@ class LambdaHandler(object):
         elif request_type == "Delete":
             self.handle_cleanup_event(event, context)
         
-        cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+        cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, None)
         
         return {}
     
