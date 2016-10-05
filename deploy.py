@@ -2,17 +2,22 @@
 
 from __future__ import print_function
 
-import os, sys, time, shutil, zipfile, subprocess
+import os, sys, time, shutil, zipfile, subprocess, argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--build-lambda-functions-only", action="store_true", help="Just build the Lambda functions and exit.")
+args = parser.parse_args()
 
 s3_lambda_upload_prefix = "lambda/"
 deployment_name = os.environ.get("LS_DEPLOYMENT_ID", "default")
 
 cf_stack_name = "lambda-scheduler-{}".format(deployment_name)
 
-try:
-    import boto3
-except:
-    raise Exception("Unable to load boto3. Try \"pip install boto3\".")
+if not args.build_lambda_functions_only:
+    try:
+        import boto3
+    except:
+        raise Exception("Unable to load boto3. Try \"pip install boto3\".")
 
 repo_dir = os.path.dirname(os.path.realpath(__file__))
 cf_template_base_path = os.path.join(repo_dir, "lambda-scheduler-base.yaml")
@@ -77,7 +82,10 @@ for each_function_source_dir in function_source_dir_list:
     shutil.make_archive(build_zip_path, "zip", function_build_dir)
     
     print("Successfully built Lambda function: {}.".format(each_function_name))
-    
+
+if args.build_lambda_functions_only:
+    sys.exit(0)
+
 caller_identity_arn = boto3.client("sts").get_caller_identity()["Arn"]
 print("AWS Identity: {}".format(caller_identity_arn))
 

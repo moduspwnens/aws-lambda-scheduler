@@ -8,11 +8,19 @@ datetime_string_format = "%Y-%m-%dT%H:%M:%SZ"
 class LambdaHandler(object):
 
     def __init__(self, context):
-        self.s3_bucket = boto3.resource("s3").Bucket(self.get_s3_bucket_name())
+        pass
 
     def handle_event(self, unvalidated_event, context):
         print("Received event: {}".format(json.dumps(unvalidated_event)))
-
+        
+        if "warming" in unvalidated_event:
+            return {
+                "message": "Function warmed successfully."
+            }
+        
+        if not hasattr(self, "s3_bucket"):
+            self.s3_bucket = boto3.resource("s3").Bucket(self.get_s3_bucket_name())
+        
         event = self.validate_event(unvalidated_event)
 
         print("Validated event: {}".format(json.dumps(event)))

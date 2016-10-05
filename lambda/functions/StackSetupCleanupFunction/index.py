@@ -12,6 +12,11 @@ class LambdaHandler(object):
     def handle_event(self, event, context):
         print("Event: {}".format(json.dumps(event)))
         
+        if "warming" in event:
+            return {
+                "message": "Function warmed successfully."
+            }
+        
         request_type = event.get("RequestType")
         
         if request_type == "Create":
