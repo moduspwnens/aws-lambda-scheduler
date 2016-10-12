@@ -137,18 +137,16 @@ Resources:
         Ref: LogRetentionDays
   
   #
-  #   Stack Setup Cleanup
+  #   Stack Cleanup
   #   
   #   This function performs basic setup and cleanup functionality when the 
-  #   stack is created / deleted.
+  #   stack is deleted.
   #   
-  #   On create:
-  #     - Nothing yet
   #   On delete:
-  #     - Clear out S3 bucket
+  #     - Clears out S3 bucket
   #
   
-  StackSetupCleanupFunction:
+  StackCleanupFunction:
     Type: AWS::Lambda::Function
     Properties:
       Description: Queues up Lambda function invocations for later execution.
@@ -156,15 +154,90 @@ Resources:
       MemorySize: 1024
       Role:
         Fn::GetAtt:
-        - StackSetupCleanupFunctionRole
+        - StackCleanupFunctionRole
         - Arn
       Code:
-        S3Bucket:
-          Ref: SharedBucket
-        S3Key: lambda/StackSetupCleanupFunction.zip
+        ZipFile: |-
+          from __future__ import print_function
+
+          import json
+          import boto3
+          import cfnresponse
+
+          class LambdaHandler(object):
+              
+              def __init__(self, context):
+                  pass
+  
+              def handle_event(self, event, context):
+                  print("Event: {}".format(json.dumps(event)))
+        
+                  request_type = event.get("RequestType")
+        
+                  if request_type == "Delete":
+                      
+                      # 
+                      # Make sure the STACK is being deleted (and not just this resource).
+                      # 
+                      # This avoids someone who's just tinkering with the template from wiping out 
+                      # the whole bucket.
+                      # 
+                      if boto3.resource("cloudformation").Stack(event["StackId"]).stack_status == "DELETE_IN_PROGRESS":
+                          self.handle_cleanup_event(event, context)
+        
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, None)
+        
+                  return {}
+    
+              def handle_cleanup_event(self, event, context):
+        
+                  s3_client = boto3.client("s3")
+                  s3_bucket_name = event["ResourceProperties"]["SharedBucket"]
+        
+                  paginator = s3_client.get_paginator("list_objects_v2")
+        
+                  response_iterator = paginator.paginate(
+                      Bucket = s3_bucket_name
+                  )
+        
+                  for each_list_response in response_iterator:
+                    keys_to_delete = []
+          
+                    for each_item in each_list_response.get("Contents", []):
+                        keys_to_delete.append(each_item["Key"])
+          
+                    if len(keys_to_delete) == 0:
+                        print("Last request for objects in {} returned none.".format(
+                            s3_bucket_name
+                        ))
+                        break
+          
+                    print("Deleting {} object(s) from {}.".format(
+                        len(keys_to_delete),
+                        s3_bucket_name
+                    ))
+          
+                    s3_client.delete_objects(
+                        Bucket = s3_bucket_name,
+                        Delete = {
+                            "Objects": list({"Key": x} for x in keys_to_delete)
+                        }
+                    )
+          
+                    print("Object(s) deleted.")
+
+          handler_object = None
+          def lambda_handler(event, context):
+              global handler_object
+    
+              if handler_object is None:
+                  handler_object = LambdaHandler(context)
+    
+              return handler_object.handle_event(event, context)
+              
       Runtime: python2.7
       Timeout: '300'
-  StackSetupCleanupFunctionRole:
+  StackCleanupFunctionRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -177,10 +250,10 @@ Resources:
           Action:
           - sts:AssumeRole
       Path: "/"
-  StackSetupCleanupFunctionRoleActions:
+  StackCleanupFunctionRoleActions:
     Type: AWS::IAM::Policy
     Properties:
-      PolicyName: StackSetupCleanupFunctionRoleActions
+      PolicyName: StackCleanupFunctionRoleActions
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -189,7 +262,12 @@ Resources:
           - logs:CreateLogStream
           - logs:PutLogEvents
           Resource:
-            Fn::Sub: arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${StackSetupCleanupFunction}:log-stream:*
+            Fn::Sub: arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${StackCleanupFunction}:log-stream:*
+        - Effect: Allow
+          Action:
+          - cloudformation:DescribeStacks
+          Resource:
+            Fn::Sub: ${AWS::StackId}
         - Effect: Allow
           Action:
           - s3:DeleteObject
@@ -201,26 +279,26 @@ Resources:
           Resource:
             Fn::Sub: arn:aws:s3:::${SharedBucket}
       Roles:
-      - Ref: StackSetupCleanupFunctionRole
-  StackSetupCleanupFunctionLogGroup:
+      - Ref: StackCleanupFunctionRole
+  StackCleanupFunctionLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName:
-        Fn::Sub: /aws/lambda/${StackSetupCleanupFunction}
+        Fn::Sub: /aws/lambda/${StackCleanupFunction}
       RetentionInDays:
         Ref: LogRetentionDays
-  StackSetupCleanupInvocation:
-    Type: Custom::StackSetupCleanupInvocation
+  StackCleanupInvocation:
+    Type: Custom::StackCleanupInvocation
     Properties:
       ServiceToken:
         Fn::GetAtt:
-        - StackSetupCleanupFunction
+        - StackCleanupFunction
         - Arn
       SharedBucket:
         Ref: SharedBucket
     DependsOn:
-    - StackSetupCleanupFunctionLogGroup
-    - StackSetupCleanupFunctionRoleActions
+    - StackCleanupFunctionLogGroup
+    - StackCleanupFunctionRoleActions
   
   SharedBucket:
     Type: AWS::S3::Bucket
@@ -228,5 +306,6 @@ Resources:
       AccessControl: Private
         
 Outputs:
-  WordGeneratorApiEndPoint:
-    Value: test
+  SharedBucket:
+    Value:
+      Ref: SharedBucket

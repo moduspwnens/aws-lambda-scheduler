@@ -2,185 +2,264 @@
 
 from __future__ import print_function
 
-import os, sys, time, shutil, zipfile, subprocess, argparse
+import os, sys, time, shutil, zipfile, subprocess, argparse, json
 
 parser = argparse.ArgumentParser()
+parser.add_argument("--stack-name", default="lambda-scheduler-default", help="Name for the CloudFormation stack.")
 parser.add_argument("--build-lambda-functions-only", action="store_true", help="Just build the Lambda functions and exit.")
-args = parser.parse_args()
+
 
 s3_lambda_upload_prefix = "lambda/"
-deployment_name = os.environ.get("LS_DEPLOYMENT_ID", "default")
+repo_dir = os.path.dirname(os.path.realpath(__file__))
+cf_template_path = os.path.join(repo_dir, "lambda-scheduler.yaml")
+s3_template_upload_key = "cf-stack-template.yaml"
+build_dir = os.path.join(repo_dir, "build")
+functions_source_dir = os.path.join(repo_dir, "lambda/functions")
 
-cf_stack_name = "lambda-scheduler-{}".format(deployment_name)
 
-if not args.build_lambda_functions_only:
+def verify_cloudformation_deploy_dependencies():
     try:
         import boto3
     except:
         raise Exception("Unable to load boto3. Try \"pip install boto3\".")
-
-repo_dir = os.path.dirname(os.path.realpath(__file__))
-cf_template_base_path = os.path.join(repo_dir, "lambda-scheduler-base.yaml")
-cf_template_path = os.path.join(repo_dir, "lambda-scheduler.yaml")
-s3_template_upload_key = "cf-stack-template.yaml"
-
-build_dir = os.path.join(repo_dir, "build")
-
-if not os.path.isdir(build_dir):
+    
     try:
-        print("Creating build directory.")
-        os.makedirs(build_dir)
+        import yaml
     except:
-        raise Exception("Error creating build directory at {}.".format(build_dir))
+        raise Exception("Unable to load yaml. Try \"pip install PyYAML\".")
 
-functions_source_dir = os.path.join(repo_dir, "lambda/functions")
+def verify_aws_credentials_set():
+    caller_identity_arn = boto3.client("sts").get_caller_identity()["Arn"]
 
-function_source_dir_list = []
+def ensure_build_dir_exists():
+    if not os.path.isdir(build_dir):
+        try:
+            print("Creating build directory.")
+            os.makedirs(build_dir)
+        except:
+            raise Exception("Error creating build directory at {}.".format(build_dir))
 
-for dir_name, subdir_list, file_list in os.walk(functions_source_dir):
-    if dir_name != functions_source_dir:
-        break
-    
-    for each_subdir in subdir_list:
-        function_source_dir_list.append(os.path.join(dir_name, each_subdir))
+def build_lambda_function_environments():
 
-for each_function_source_dir in function_source_dir_list:
+    function_source_dir_list = []
+
+    for dir_name, subdir_list, file_list in os.walk(functions_source_dir):
+        if dir_name != functions_source_dir:
+            break
     
-    each_function_name = each_function_source_dir.split("/")[-1]
+        for each_subdir in subdir_list:
+            function_source_dir_list.append(os.path.join(dir_name, each_subdir))
+
+    for each_function_source_dir in function_source_dir_list:
     
-    print("Building Lambda function: {}".format(each_function_name))
+        each_function_name = each_function_source_dir.split("/")[-1]
     
-    function_build_dir = os.path.join(build_dir, each_function_name)
+        print("Building Lambda function: {}".format(each_function_name))
     
-    if os.path.exists(function_build_dir):
-        shutil.rmtree(function_build_dir)
+        function_build_dir = os.path.join(build_dir, each_function_name)
     
-    shutil.copytree(each_function_source_dir, function_build_dir)
+        if os.path.exists(function_build_dir):
+            shutil.rmtree(function_build_dir)
     
-    pip_requirements_path = os.path.join(function_build_dir, "requirements.txt")
+        shutil.copytree(each_function_source_dir, function_build_dir)
     
-    if os.path.exists(pip_requirements_path):
-        print("Installing dependencies.")
-        p = subprocess.Popen(
-            ["pip", "install", "-r", pip_requirements_path, "-t", function_build_dir],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
+        pip_requirements_path = os.path.join(function_build_dir, "requirements.txt")
+    
+        if os.path.exists(pip_requirements_path):
+            print("Installing dependencies.")
+            p = subprocess.Popen(
+                ["pip", "install", "-r", pip_requirements_path, "-t", function_build_dir],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+        
+            exit_code = p.wait()
+            p_stdout, p_stderr = p.communicate()
+        
+            if exit_code != 0:
+                print("pip invocation failed.", file=sys.stderr)
+                print(p_stderr, file=sys.stderr)
+                sys.exit(1)
+    
+        build_zip_path = os.path.join(build_dir, each_function_name)
+        if os.path.exists("{}.zip".format(build_zip_path)):
+            os.unlink("{}.zip".format(build_zip_path))
+    
+        shutil.make_archive(build_zip_path, "zip", function_build_dir)
+    
+        print("Successfully built Lambda function: {}.".format(each_function_name))
+    
+    return function_source_dir_list
+
+
+def create_base_cloudformation_stack(cf_stack_name):
+
+    '''
+        Create "base" CloudFormation template containing only the S3 bucket and the Lambda 
+        function that deletes its objects on stack deletion.
+
+        This gives us a bucket to put the full template and Lambda function ZIPs into while 
+        still keeping the stack in a state where the resources will be deleted if the user 
+        deletes the stack.
+    '''
+
+    cf_template_object = yaml.load(open(cf_template_path))
+    for each_key in cf_template_object.keys():
+        if each_key not in ["AWSTemplateFormatVersion", "Outputs", "Description", "Resources", "Parameters"]:
+            del cf_template_object[each_key]
+
+    for each_key in cf_template_object.get("Parameters", {}).keys():
+        if each_key != "LogRetentionDays":
+            del cf_template_object["Parameters"][each_key]
+
+    for each_key in cf_template_object.get("Outputs", {}).keys():
+        if each_key != "SharedBucket":
+            del cf_template_object["Outputs"][each_key]
+
+    base_resources_list = [
+        # The bucket into which we'll load additional resources.
+        "SharedBucket", 
+    
+        # The Lambda function that clears out the S3 bucket when deleted.
+        "StackCleanupFunction",
+        "StackCleanupFunctionRole",
+        "StackCleanupFunctionRoleActions",
+        "StackCleanupFunctionLogGroup",
+        "StackCleanupInvocation"
+    ]
+
+    for each_key in cf_template_object.get("Resources", {}).keys():
+        if each_key not in base_resources_list:
+            del cf_template_object["Resources"][each_key]
+
+    cf_template_object["Description"] = "Initial Deployment: {}".format(cf_template_object["Description"])
+
+    cloudformation_client = boto3.client("cloudformation")
+    response = cloudformation_client.create_stack(
+        StackName = cf_stack_name,
+        TemplateBody = json.dumps(cf_template_object, indent=4),
+        Capabilities = ["CAPABILITY_NAMED_IAM"]
+    )
+
+    stack_id = response["StackId"]
+
+    print("New CloudFormation Stack ID: {}".format(stack_id))
+
+    last_status = "CREATE_IN_PROGRESS"
+    s3_bucket_name = None
+
+    while True:
+        response = cloudformation_client.describe_stacks(
+            StackName = stack_id
         )
+    
+        this_stack = response["Stacks"][0]
+    
+        last_status = this_stack["StackStatus"]
+    
+        print(" > Stack status: {}".format(last_status))
+    
+        if last_status != "CREATE_IN_PROGRESS":
+            for each_output_pair in this_stack.get("Outputs", []):
+                if each_output_pair["OutputKey"] == "SharedBucket":
+                    s3_bucket_name = each_output_pair["OutputValue"]
+                    break
         
-        exit_code = p.wait()
-        p_stdout, p_stderr = p.communicate()
-        
-        if exit_code != 0:
-            print("pip invocation failed.", file=sys.stderr)
-            print(p_stderr, file=sys.stderr)
-            sys.exit(1)
+            break
     
-    build_zip_path = os.path.join(build_dir, each_function_name)
-    if os.path.exists("{}.zip".format(build_zip_path)):
-        os.unlink("{}.zip".format(build_zip_path))
+        time.sleep(10)
+
+    if last_status != "CREATE_COMPLETE":
+        raise Exception("Stack reached unexpected status: {}".format(last_status))
+
+    if s3_bucket_name is None:
+        raise Exception("Unabled to find shared S3 bucket name in stack outputs.")
     
-    shutil.make_archive(build_zip_path, "zip", function_build_dir)
+    print("Shared S3 bucket: {}".format(s3_bucket_name))
     
-    print("Successfully built Lambda function: {}.".format(each_function_name))
+    return stack_id, s3_bucket_name
 
-if args.build_lambda_functions_only:
-    sys.exit(0)
+def upload_lambda_function_deployment_packages(s3_bucket_name, function_source_dir_list):
 
-caller_identity_arn = boto3.client("sts").get_caller_identity()["Arn"]
-print("AWS Identity: {}".format(caller_identity_arn))
-
-cloudformation_client = boto3.client("cloudformation")
-response = cloudformation_client.create_stack(
-    StackName = cf_stack_name,
-    TemplateBody = open(cf_template_base_path).read()
-)
-
-stack_id = response["StackId"]
-
-print("New CloudFormation Stack ID: {}".format(stack_id))
-
-last_status = "CREATE_IN_PROGRESS"
-s3_bucket_name = None
-
-while True:
-    response = cloudformation_client.describe_stacks(
-        StackName = stack_id
-    )
-    
-    this_stack = response["Stacks"][0]
-    
-    last_status = this_stack["StackStatus"]
-    
-    print(" > Stack status: {}".format(last_status))
-    
-    if last_status != "CREATE_IN_PROGRESS":
-        for each_output_pair in this_stack.get("Outputs", []):
-            if each_output_pair["OutputKey"] == "SharedBucket":
-                s3_bucket_name = each_output_pair["OutputValue"]
-                break
-        
-        break
-    
-    time.sleep(10)
-
-if last_status != "CREATE_COMPLETE":
-    raise Exception("Stack reached unexpected status: {}".format(last_status))
-
-if s3_bucket_name is None:
-    raise Exception("Unabled to find shared S3 bucket name in stack outputs.")
-
-print("Shared S3 bucket: {}".format(s3_bucket_name))
-
-s3_client = boto3.client("s3")
-s3_client.put_object(
-    Body = open(cf_template_path),
-    Bucket = s3_bucket_name,
-    Key = s3_template_upload_key
-)
-
-for each_function_source_dir in function_source_dir_list:
-    
-    each_function_name = each_function_source_dir.split("/")[-1]
-    
-    build_zip_path = os.path.join(build_dir, each_function_name)
-    
-    print("Uploading {}.zip.".format(each_function_name))
-    
+    s3_client = boto3.client("s3")
     s3_client.put_object(
-        Body = open("{}.zip".format(build_zip_path)),
+        Body = open(cf_template_path),
         Bucket = s3_bucket_name,
-        Key = "lambda/{}.zip".format(each_function_name)
+        Key = s3_template_upload_key
     )
 
-cloudformation_client.update_stack(
-    StackName = stack_id,
-    TemplateURL = "https://s3.amazonaws.com/{}/{}".format(
-        s3_bucket_name,
-        s3_template_upload_key
-    ),
-    UsePreviousTemplate = False,
-    Capabilities = ["CAPABILITY_NAMED_IAM"]
-)
+    for each_function_source_dir in function_source_dir_list:
+    
+        each_function_name = each_function_source_dir.split("/")[-1]
+    
+        build_zip_path = os.path.join(build_dir, each_function_name)
+    
+        print("Uploading {}.zip.".format(each_function_name))
+    
+        s3_client.put_object(
+            Body = open("{}.zip".format(build_zip_path)),
+            Bucket = s3_bucket_name,
+            Key = "lambda/{}.zip".format(each_function_name)
+        )
 
-last_status = "UPDATE_IN_PROGRESS"
+def update_base_stack_to_full_stack(stack_id, s3_bucket_name):
 
-while True:
-    response = cloudformation_client.describe_stacks(
-        StackName = stack_id
+    print("Updating stack's template with full content.")
+    
+    cloudformation_client = boto3.client("cloudformation")
+    cloudformation_client.update_stack(
+        StackName = stack_id,
+        TemplateURL = "https://s3.amazonaws.com/{}/{}".format(
+            s3_bucket_name,
+            s3_template_upload_key
+        ),
+        UsePreviousTemplate = False,
+        Capabilities = ["CAPABILITY_NAMED_IAM"]
     )
-    
-    this_stack = response["Stacks"][0]
-    
-    last_status = this_stack["StackStatus"]
-    
-    print(" > Stack status: {}".format(last_status))
-    
-    if last_status != "UPDATE_IN_PROGRESS":
-        break
-    
-    time.sleep(10)
 
-if last_status != "UPDATE_COMPLETE":
-    raise Exception("Stack reached unexpected status: {}".format(last_status))
+    last_status = "UPDATE_IN_PROGRESS"
 
-print("Deploy complete.")
+    while True:
+        response = cloudformation_client.describe_stacks(
+            StackName = stack_id
+        )
+    
+        this_stack = response["Stacks"][0]
+    
+        last_status = this_stack["StackStatus"]
+    
+        print(" > Stack status: {}".format(last_status))
+    
+        if last_status not in ["UPDATE_IN_PROGRESS", "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS"]:
+            break
+    
+        time.sleep(10)
+
+    if last_status != "UPDATE_COMPLETE":
+        raise Exception("Stack reached unexpected status: {}".format(last_status))
+
+if __name__ == "__main__":
+    
+    args = parser.parse_args()
+    
+    if not args.build_lambda_functions_only:
+        verify_cloudformation_deploy_dependencies()
+    
+    ensure_build_dir_exists()
+    
+    function_source_dir_list = build_lambda_function_environments()
+    
+    if args.build_lambda_functions_only:
+        sys.exit(0)
+        
+    import boto3, yaml
+    
+    verify_aws_credentials_set()
+    
+    stack_id, s3_bucket_name = create_base_cloudformation_stack(args.stack_name)
+    
+    upload_lambda_function_deployment_packages(s3_bucket_name, function_source_dir_list)
+    
+    update_base_stack_to_full_stack(stack_id, s3_bucket_name)
+    
+    print("Deploy complete.")
