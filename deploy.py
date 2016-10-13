@@ -161,7 +161,7 @@ def build_lambda_function_environments():
         
         if os.path.exists(zip_output_path):
             if each_function_previous_build_metadata["source"] == source_dir_hash:
-                if file_md5_checksum(zip_output_path) == each_function_previous_build_metadata["zip"]:
+                if file_sha256_checksum_for_lambda(zip_output_path) == each_function_previous_build_metadata["zip"]:
                     print("{} already built.".format(each_function_name))
                     continue
         
@@ -201,7 +201,7 @@ def build_lambda_function_environments():
         
         new_build_metadata = {
             "source": source_dir_hash,
-            "zip": file_md5_checksum(zip_output_path)
+            "zip": file_sha256_checksum_for_lambda(zip_output_path)
         }
         
         open(each_function_build_metadata_file_path, "w").write(json.dumps(new_build_metadata, indent=4))
@@ -357,12 +357,13 @@ def update_base_stack_to_full_stack(stack_id, s3_bucket_name):
     if last_status != "UPDATE_COMPLETE":
         raise Exception("Stack reached unexpected status: {}".format(last_status))
 
-def file_md5_checksum(fname):
-    hash_md5 = hashlib.md5()
+def file_sha256_checksum_for_lambda(fname):
+    hash_sha256 = hashlib.sha256()
     with open(fname, "rb") as f:
         for chunk in iter(lambda: f.read(4096), b""):
-            hash_md5.update(chunk)
-    return hash_md5.hexdigest()
+            hash_sha256.update(chunk)
+    
+    return hash_sha256.digest().encode('base64').strip()
 
 if __name__ == "__main__":
     
