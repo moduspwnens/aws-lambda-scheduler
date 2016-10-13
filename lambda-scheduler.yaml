@@ -120,12 +120,6 @@ Resources:
           - cloudformation:DescribeStackResource
           Resource:
             Fn::Sub: ${AWS::StackId}
-        - Effect: Allow
-          Action:
-          - lambda:GetFunction
-          - lambda:GetPolicy
-          Resource:
-            Fn::Sub: arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:*
       Roles:
       - Ref: InvocationQueuerFunctionRole
   InvocationQueuerFunctionLogGroup:

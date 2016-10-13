@@ -1,6 +1,37 @@
 from __future__ import print_function
 
-import os, sys, unittest, uuid, datetime, importlib
+import os, sys, unittest, uuid, datetime, importlib, logging
+
+logging.getLogger('boto3').setLevel(logging.WARNING)
+logging.getLogger('botocore').setLevel(logging.WARNING)
+logging.getLogger('nose').setLevel(logging.WARNING)
+
+os.environ["AWS_DEFAULT_REGION"] = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+
+stubber_arg_lists = {}
+
+def create_boto3_client_with_stubber(*args, **kwargs):
+    import boto3
+    from botocore.stub import Stubber
+    
+    new_client = boto3.client(*args, **kwargs)
+    
+    service_name = args[0]
+    
+    if service_name in stubber_arg_lists:
+        new_stubber = Stubber(new_client)
+        stubber_args = stubber_arg_lists[service_name]
+        
+        for each_invocation_set in stubber_args:
+            method_name, args, kwargs = tuple(each_invocation_set)
+            each_method = getattr(new_stubber, method_name)
+            each_method(*args, **kwargs)
+        
+        stubber_arg_lists[service_name] = []
+        
+        new_stubber.activate()
+    
+    return new_client
 
 class LambdaFunctionTestCase(unittest.TestCase):
     
@@ -23,10 +54,19 @@ class LambdaFunctionTestCase(unittest.TestCase):
         lambda_function_module = eval("importlib.import_module('{}.index')".format(self.function_name))
         
         self.lambda_function = lambda_function_module
+        
+        if hasattr(self.lambda_function, "boto3"):
+            self.lambda_function.boto3.client = create_boto3_client_with_stubber
     
     def tearDown(self):
         for each_path in self.added_module_paths:
             sys.path.remove(each_path)
+    
+    def setup_boto3_stubber(self, service_name, method_name, *args, **kwargs):
+        if service_name not in stubber_arg_lists:
+            stubber_arg_lists[service_name] = []
+        stubber_arg_lists[service_name].append((method_name, args, kwargs))
+    
 
 class LambdaContext(object):
     

@@ -103,7 +103,7 @@ class LambdaHandler(object):
     def get_own_cloudformation_metadata(self):
 
         if hasattr(self, "_own_cloudformation_metadata"):
-          return self._own_cloudformation_metadata
+            return self._own_cloudformation_metadata
 
         caller_arn = boto3.client("sts").get_caller_identity()["Arn"]
         caller_role = caller_arn.split(":")[5].split("/")[1]
@@ -116,19 +116,22 @@ class LambdaHandler(object):
         this_stack_id = None
 
         for each_statement in policy_response["PolicyDocument"]["Statement"]:
-          if len(each_statement.get("Action", [])) == 0:
-              continue
+            if len(each_statement.get("Action", [])) == 0:
+                continue
 
-          if each_statement["Action"][0].lower() == "cloudformation:describeStackResource".lower():
-              this_stack_id = each_statement["Resource"]
-              break
+            if each_statement["Action"][0].lower() == "cloudformation:describeStackResource".lower():
+                this_stack_id = each_statement["Resource"]
+                break
 
         if this_stack_id is None:
-          raise Exception("Unable to determine CloudFormation stack ID from IAM policy.")
+            raise Exception("Unable to determine CloudFormation stack ID from IAM policy.")
+        
+        response = boto3.client("cloudformation").describe_stack_resource(
+            StackName = this_stack_id,
+            LogicalResourceId = "InvocationQueuerFunction"
+        )
 
-        own_stack_resource = boto3.resource("cloudformation").StackResource(this_stack_id, "InvocationQueuerFunction")
-
-        own_metadata = json.loads(own_stack_resource.metadata)
+        own_metadata = json.loads(response["StackResourceDetail"]["Metadata"])
 
         print("Own CloudFormation metadata: {}".format(json.dumps(own_metadata)))
 
